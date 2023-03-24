@@ -61,8 +61,10 @@ static char *k8s_log_path = NULL;
 static char short_cuuid[TRUNC_ID_LEN + 1];
 static char *cuuid = NULL;
 static char *name = NULL;
+static char *log_ctx = NULL;
 static size_t cuuid_len = 0;
 static size_t name_len = 0;
+static size_t log_ctx_len = 0;
 static char *container_id_full = NULL;
 static char *container_id = NULL;
 static char *container_name = NULL;
@@ -80,6 +82,7 @@ static void parse_log_path(char *log_config);
 static const char *stdpipe_name(stdpipe_t pipe);
 static int write_journald(int pipe, char *buf, ssize_t num_read);
 static int write_k8s_log(stdpipe_t pipe, const char *buf, ssize_t buflen);
+static int write_dlt_log(stdpipe_t pipe, const char *buf, ssize_t buflen);
 static bool get_line_len(ptrdiff_t *line_len, const char *buf, ssize_t buflen);
 static ssize_t writev_buffer_append_segment(int fd, writev_buffer_t *buf, const void *data, ssize_t len);
 static ssize_t writev_buffer_append_segment_no_flush(writev_buffer_t *buf, const void *data, ssize_t len);
@@ -150,6 +153,7 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 			syslog_identifier_len = name_len + SYSLOG_IDENTIFIER_EQ_LEN;
 		}
 		if (tag) {
+			g_free(container_tag);
 			container_tag = g_strdup_printf("CONTAINER_TAG=%s", tag);
 			container_tag_len = strlen(container_tag);
 
@@ -158,6 +162,9 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 			syslog_identifier_len = strlen(syslog_identifier);
 		}
 	}
+
+	log_ctx = (tag) ? tag : "CTA";
+	log_ctx_len = strlen(log_ctx);
 }
 
 /*
@@ -226,6 +233,9 @@ static void parse_log_path(char *log_config)
 /* write container output to all logs the user defined */
 bool write_to_logs(stdpipe_t pipe, char *buf, ssize_t num_read)
 {
+	if (write_dlt_log(pipe, buf, num_read) < 0) {
+		nwarn("write_dlt_log failed");
+	}
 	if (use_k8s_logging && write_k8s_log(pipe, buf, num_read) < 0) {
 		nwarn("write_k8s_log failed");
 		return G_SOURCE_CONTINUE;
@@ -236,7 +246,6 @@ bool write_to_logs(stdpipe_t pipe, char *buf, ssize_t num_read)
 	}
 	return true;
 }
-
 
 /* write to systemd journal. If the pipe is stdout, write with notice priority,
  * otherwise, write with error priority. Partial lines (that don't end in a newline) are buffered
@@ -434,6 +443,57 @@ static int write_k8s_log(stdpipe_t pipe, const char *buf, ssize_t buflen)
 	}
 
 	return 0;
+}
+
+static int write_dlt_log(stdpipe_t /*pipe*/, const char *buf, ssize_t buflen)
+{
+	if (buflen < 1) {
+		return 0;
+	}
+
+	int fd[2];
+	pid_t cpid;
+
+	if (pipe(fd) == -1) {
+		perror("pipe");
+		return -1;
+	}
+
+	cpid = fork();
+
+	if (cpid < 0) {
+		perror("fork");
+		return -1;
+	}
+
+	else if (cpid == 0) {
+		close(fd[1]);
+		if (dup2(fd[0], STDIN_FILENO)) {
+			perror("dup2");
+			return -1;
+		}
+		char *args[] = {
+			"/usr/bin/dlt-adaptor-stdin",
+			"-a", "CTM",
+			"-c", log_ctx,
+			NULL};
+		close(STDOUT_FILENO); // suppress dlt-adaptor-stdin output
+		execv(args[0], args);
+		perror("execve");
+		return -1;
+	}
+
+	else {
+		const char sep[] = ": ";
+		close(fd[0]);
+		if (name) {
+			write(fd[1], name, name_len);
+			write(fd[1], sep, strlen(sep));
+		}
+		write(fd[1], buf, buflen);
+		close(fd[1]);
+		return 0;
+	}
 }
 
 /* Find the end of the line, or alternatively the end of the buffer.
