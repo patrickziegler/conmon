@@ -72,6 +72,7 @@ static char *container_tag = NULL;
 static size_t container_tag_len;
 static char *syslog_identifier = NULL;
 static size_t syslog_identifier_len;
+int dlt_pipe_fd[2];
 
 typedef struct {
 	int iovcnt;
@@ -165,6 +166,33 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 
 	log_ctx = (tag) ? tag : "CTA";
 	log_ctx_len = strlen(log_ctx);
+
+	if (pipe(dlt_pipe_fd) == -1) {
+		nexit("pipe: Failed to create dlt_pipe_fd");
+	}
+
+	pid_t cpid = fork();
+
+	if (cpid < 0) {
+		pexit("fork: Failed to fork process");
+	}
+
+	else if (cpid == 0) {
+		close(dlt_pipe_fd[1]);
+		if (dup2(dlt_pipe_fd[0], STDIN_FILENO)) {
+			pexit("dup2: Failed to reassign stdin");
+		}
+		char *args[] = {
+			"/usr/bin/dlt-adaptor-stdin",
+			"-a", "CTM",
+			"-c", log_ctx,
+			NULL};
+		close(STDOUT_FILENO); // suppress dlt-adaptor-stdin output
+		execv(args[0], args);
+		pexit("execv: Failed to become dlt-adaptor-stdin");
+	}
+
+	close(dlt_pipe_fd[0]);
 }
 
 /*
@@ -447,53 +475,16 @@ static int write_k8s_log(stdpipe_t pipe, const char *buf, ssize_t buflen)
 
 static int write_dlt_log(stdpipe_t /*pipe*/, const char *buf, ssize_t buflen)
 {
+	static const char sep[] = ": ";
 	if (buflen < 1) {
 		return 0;
 	}
-
-	int fd[2];
-	pid_t cpid;
-
-	if (pipe(fd) == -1) {
-		perror("pipe");
-		return -1;
+	if (name) {
+		write(dlt_pipe_fd[1], name, name_len);
+		write(dlt_pipe_fd[1], sep, strlen(sep));
 	}
-
-	cpid = fork();
-
-	if (cpid < 0) {
-		perror("fork");
-		return -1;
-	}
-
-	else if (cpid == 0) {
-		close(fd[1]);
-		if (dup2(fd[0], STDIN_FILENO)) {
-			perror("dup2");
-			return -1;
-		}
-		char *args[] = {
-			"/usr/bin/dlt-adaptor-stdin",
-			"-a", "CTM",
-			"-c", log_ctx,
-			NULL};
-		close(STDOUT_FILENO); // suppress dlt-adaptor-stdin output
-		execv(args[0], args);
-		perror("execve");
-		return -1;
-	}
-
-	else {
-		const char sep[] = ": ";
-		close(fd[0]);
-		if (name) {
-			write(fd[1], name, name_len);
-			write(fd[1], sep, strlen(sep));
-		}
-		write(fd[1], buf, buflen);
-		close(fd[1]);
-		return 0;
-	}
+	write(dlt_pipe_fd[1], buf, buflen);
+	return 0;
 }
 
 /* Find the end of the line, or alternatively the end of the buffer.
@@ -687,4 +678,6 @@ void sync_logs(void)
 	if (k8s_log_fd > 0)
 		if (fsync(k8s_log_fd) < 0)
 			pwarn("Failed to sync log file before exit");
+	if (dlt_pipe_fd[1] > 0)
+		close(dlt_pipe_fd[1]);
 }
