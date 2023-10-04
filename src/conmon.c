@@ -365,6 +365,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	register_dlt();
+
 	if (!WIFEXITED(runtime_status) || WEXITSTATUS(runtime_status) != 0) {
 		/*
 		 * Read from container stderr for any error and send it to parent

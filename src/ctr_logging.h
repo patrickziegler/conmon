@@ -11,5 +11,6 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 void sync_logs(void);
 gboolean logging_is_passthrough(void);
 void close_logging_fds(void);
+void register_dlt(void);
 
 #endif /* !defined(CTR_LOGGING_H) */
