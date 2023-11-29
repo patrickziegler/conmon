@@ -4,6 +4,20 @@
 #include "config.h"
 #include <string.h>
 
+#include <dlt/dlt_user.h>
+
+#define PS_DLT_APP "PODM"
+#define PS_DLT_CONTEXT "CNTR"
+#define PS_DLT_APP_DESC "Podman"
+#define PS_DLT_CONTEXT_DESC "Container"
+
+static char dlt_apid[DLT_ID_SIZE];
+static char dlt_ctid[DLT_ID_SIZE];
+static char* dlt_prefix = NULL;
+static size_t dlt_prefix_len = 0;
+
+DLT_DECLARE_CONTEXT(dlt_context)
+
 // if the systemd development files were found, we can log to systemd
 #ifdef USE_JOURNALD
 #include <systemd/sd-journal.h>
@@ -80,6 +94,7 @@ static void parse_log_path(char *log_config);
 static const char *stdpipe_name(stdpipe_t pipe);
 static int write_journald(int pipe, char *buf, ssize_t num_read);
 static int write_k8s_log(stdpipe_t pipe, const char *buf, ssize_t buflen);
+static int write_dlt_log(stdpipe_t pipe, const char *buf, ssize_t buflen);
 static bool get_line_len(ptrdiff_t *line_len, const char *buf, ssize_t buflen);
 static ssize_t writev_buffer_append_segment(int fd, writev_buffer_t *buf, const void *data, ssize_t len);
 static ssize_t writev_buffer_append_segment_no_flush(writev_buffer_t *buf, const void *data, ssize_t len);
@@ -144,6 +159,8 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 		if (name) {
 			name_len = strlen(name);
 			container_name = g_strdup_printf("CONTAINER_NAME=%s", name);
+			dlt_prefix = g_strdup_printf("[%s] ", name);
+			dlt_prefix_len = strlen(dlt_prefix);
 
 			g_free(syslog_identifier);
 			syslog_identifier = g_strdup_printf("SYSLOG_IDENTIFIER=%s", name);
@@ -157,6 +174,14 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 			syslog_identifier = g_strdup_printf("SYSLOG_IDENTIFIER=%s", tag);
 			syslog_identifier_len = strlen(syslog_identifier);
 		}
+	}
+
+	dlt_set_id(dlt_apid, PS_DLT_APP);
+
+	if (tag && strlen(tag) <= DLT_ID_SIZE) {
+		dlt_set_id(dlt_ctid, tag);
+	} else {
+		dlt_set_id(dlt_ctid, PS_DLT_CONTEXT);
 	}
 }
 
@@ -226,6 +251,9 @@ static void parse_log_path(char *log_config)
 /* write container output to all logs the user defined */
 bool write_to_logs(stdpipe_t pipe, char *buf, ssize_t num_read)
 {
+	if (write_dlt_log(pipe, buf, num_read) < 0) {
+		nwarn("write_dlt_log failed");
+	}
 	if (use_k8s_logging && write_k8s_log(pipe, buf, num_read) < 0) {
 		nwarn("write_k8s_log failed");
 		return G_SOURCE_CONTINUE;
@@ -436,6 +464,33 @@ static int write_k8s_log(stdpipe_t pipe, const char *buf, ssize_t buflen)
 	return 0;
 }
 
+static int write_dlt_log(stdpipe_t /*pipe*/, const char *buf, ssize_t buflen)
+{
+	if (buflen < 1) {
+		return 0;
+	}
+
+	char dlt_msg[dlt_prefix_len + buflen];
+	char *dlt_msg_ptr = dlt_msg;
+
+	if (dlt_prefix) {
+		dlt_msg_ptr = memccpy(dlt_msg_ptr, dlt_prefix, 0, dlt_prefix_len + 1);
+		dlt_msg_ptr -= 1; // for overwriting '\0' with next call to memccpy
+	}
+	memccpy(dlt_msg_ptr, buf, 0, buflen + 1);
+
+	DLT_LOG_STRING(dlt_context, DLT_LOG_INFO, dlt_msg);
+
+	return 0;
+}
+
+void register_dlt(void)
+{
+	DLT_REGISTER_APP(dlt_apid, PS_DLT_APP_DESC);
+	DLT_REGISTER_CONTEXT(dlt_context, dlt_ctid, PS_DLT_CONTEXT_DESC);
+	DLT_LOG_STRING(dlt_context, DLT_LOG_INFO, "Hello!");
+}
+
 /* Find the end of the line, or alternatively the end of the buffer.
  * Returns false in the former case (it's a whole line) or true in the latter (it's a partial)
  */
@@ -623,6 +678,10 @@ static void reopen_k8s_file(void)
 
 void sync_logs(void)
 {
+	DLT_LOG_STRING(dlt_context, DLT_LOG_INFO, "Bye!");
+	DLT_UNREGISTER_CONTEXT(dlt_context);
+	DLT_UNREGISTER_APP_FLUSH_BUFFERED_LOGS();
+
 	/* Sync the logs to disk */
 	if (k8s_log_fd > 0)
 		if (fsync(k8s_log_fd) < 0)
